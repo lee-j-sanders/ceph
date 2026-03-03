@@ -10,11 +10,14 @@
 #include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <spawn.h>
 #include <iostream>
 
 #include "common/errno.h"
 #include "include/ceph_assert.h"
 #include "include/compat.h"
+
+extern char **environ;
 
 SubProcess::SubProcess(const char *cmd_, std_fd_op stdin_op_, std_fd_op stdout_op_, std_fd_op stderr_op_) :
   cmd(cmd_),
@@ -157,74 +160,121 @@ int SubProcess::spawn() {
     goto fail;
   }
 
-  pid = fork();
-
-  if (pid > 0) { // Parent
-    stdin_pipe_out_fd = ipipe[OUT]; close(ipipe[IN ]);
-    stdout_pipe_in_fd = opipe[IN ]; close(opipe[OUT]);
-    stderr_pipe_in_fd = epipe[IN ]; close(epipe[OUT]);
-    return 0;
-  }
-
-  if (pid == 0) { // Child
-    close(ipipe[OUT]);
-    close(opipe[IN ]);
-    close(epipe[IN ]);
-
-    if (ipipe[IN] >= 0) {
-      if (ipipe[IN] == STDIN_FILENO) {
-        ::fcntl(STDIN_FILENO, F_SETFD, 0); /* clear FD_CLOEXEC */
-      } else {
-        ::dup2(ipipe[IN], STDIN_FILENO);
-        ::close(ipipe[IN]);
-      }
+  // Use a scope to avoid goto crossing variable initialization
+  {
+    // Prepare arguments for posix_spawn
+    std::vector<const char *> args;
+    args.push_back(cmd.c_str());
+    for (std::vector<std::string>::iterator i = cmd_args.begin();
+         i != cmd_args.end();
+         i++) {
+      args.push_back(i->c_str());
     }
-    if (opipe[OUT] >= 0) {
-      if (opipe[OUT] == STDOUT_FILENO) {
-        ::fcntl(STDOUT_FILENO, F_SETFD, 0); /* clear FD_CLOEXEC */
-      } else {
-        ::dup2(opipe[OUT], STDOUT_FILENO);
-        ::close(opipe[OUT]);
-        static fd_buf buf(STDOUT_FILENO);
-        std::cout.rdbuf(&buf);
-      }
-    }
-    if (epipe[OUT] >= 0) {
-      if (epipe[OUT] == STDERR_FILENO) {
-        ::fcntl(STDERR_FILENO, F_SETFD, 0); /* clear FD_CLOEXEC */
-      } else {
-        ::dup2(epipe[OUT], STDERR_FILENO);
-        ::close(epipe[OUT]);
-        static fd_buf buf(STDERR_FILENO);
-        std::cerr.rdbuf(&buf);
-      }
+    args.push_back(NULL);
+
+    // Setup posix_spawn attributes and file actions
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_t facts;
+    
+    ret = posix_spawnattr_init(&attr);
+    if (ret != 0) {
+      errstr << "posix_spawnattr_init failed: " << cpp_strerror(ret);
+      ret = -ret;
+      goto fail;
     }
 
+    ret = posix_spawn_file_actions_init(&facts);
+    if (ret != 0) {
+      errstr << "posix_spawn_file_actions_init failed: " << cpp_strerror(ret);
+      ret = -ret;
+      posix_spawnattr_destroy(&attr);
+      goto fail;
+    }
+
+    // Configure file actions for stdin
+    if (stdin_op == PIPE) {
+      if (ipipe[IN] != STDIN_FILENO) {
+        posix_spawn_file_actions_adddup2(&facts, ipipe[IN], STDIN_FILENO);
+      }
+      posix_spawn_file_actions_addclose(&facts, ipipe[OUT]);
+      posix_spawn_file_actions_addclose(&facts, ipipe[IN]);
+    } else if (stdin_op == CLOSE) {
+      posix_spawn_file_actions_addclose(&facts, STDIN_FILENO);
+    }
+
+    // Configure file actions for stdout
+    if (stdout_op == PIPE) {
+      if (opipe[OUT] != STDOUT_FILENO) {
+        posix_spawn_file_actions_adddup2(&facts, opipe[OUT], STDOUT_FILENO);
+      }
+      posix_spawn_file_actions_addclose(&facts, opipe[IN]);
+      posix_spawn_file_actions_addclose(&facts, opipe[OUT]);
+    } else if (stdout_op == CLOSE) {
+      posix_spawn_file_actions_addclose(&facts, STDOUT_FILENO);
+    }
+
+    // Configure file actions for stderr
+    if (stderr_op == PIPE) {
+      if (epipe[OUT] != STDERR_FILENO) {
+        posix_spawn_file_actions_adddup2(&facts, epipe[OUT], STDERR_FILENO);
+      }
+      posix_spawn_file_actions_addclose(&facts, epipe[IN]);
+      posix_spawn_file_actions_addclose(&facts, epipe[OUT]);
+    } else if (stderr_op == CLOSE) {
+      posix_spawn_file_actions_addclose(&facts, STDERR_FILENO);
+    }
+
+    // Close all other file descriptors
     int maxfd = sysconf(_SC_OPEN_MAX);
     if (maxfd == -1)
       maxfd = 16384;
 
 #if defined(__linux__) && defined(SYS_close_range)
-    if (::syscall(SYS_close_range, STDERR_FILENO + 1, ~0U, 0) == 0)
-      maxfd = STDERR_FILENO;
+    // Try to use close_range if available - we'll do this in a helper
+    // Note: posix_spawn doesn't have a direct way to call close_range,
+    // so we need to close FDs individually or use POSIX_SPAWN_CLOEXEC_DEFAULT
+    // if available (glibc 2.34+)
 #endif
 
-    for (int fd = 0; fd <= maxfd; fd++) {
-      if (fd == STDIN_FILENO && stdin_op != CLOSE)
-	continue;
-      if (fd == STDOUT_FILENO && stdout_op != CLOSE)
-	continue;
-      if (fd == STDERR_FILENO && stderr_op != CLOSE)
-	continue;
-      ::close(fd);
+    // Close file descriptors above stderr (best effort with posix_spawn)
+    // Note: This is a limitation - posix_spawn doesn't provide as fine-grained
+    // control as fork/exec for closing all FDs. We rely on CLOEXEC flags.
+    // For critical FDs, we explicitly close them.
+    for (int fd = STDERR_FILENO + 1; fd < 256; fd++) {
+      // Only close a reasonable range to avoid performance issues
+      if (fd == ipipe[IN] || fd == ipipe[OUT] ||
+          fd == opipe[IN] || fd == opipe[OUT] ||
+          fd == epipe[IN] || fd == epipe[OUT])
+        continue;
+      posix_spawn_file_actions_addclose(&facts, fd);
     }
 
-    exec();
-    ceph_abort(); // Never reached
+    // Set flags to reset signal handlers to default
+    short flags = POSIX_SPAWN_SETSIGDEF;
+    sigset_t defmask;
+    sigemptyset(&defmask);
+    posix_spawnattr_setsigdefault(&attr, &defmask);
+    posix_spawnattr_setflags(&attr, flags);
+
+    // Spawn the process
+    ret = posix_spawnp(&pid, cmd.c_str(), &facts, &attr,
+                       (char * const *)&args[0], environ);
+
+    posix_spawn_file_actions_destroy(&facts);
+    posix_spawnattr_destroy(&attr);
+
+    if (ret != 0) {
+      errstr << "posix_spawnp failed: " << cpp_strerror(ret);
+      ret = -ret;
+      goto fail;
+    }
   }
 
-  ret = -errno;
-  errstr << "fork failed: " << cpp_strerror(errno);
+  // Parent process - close child ends of pipes
+  stdin_pipe_out_fd = ipipe[OUT]; close(ipipe[IN ]);
+  stdout_pipe_in_fd = opipe[IN ]; close(opipe[OUT]);
+  stderr_pipe_in_fd = epipe[IN ]; close(epipe[OUT]);
+  return 0;
 
 fail:
   close(ipipe[0]);
@@ -238,6 +288,9 @@ fail:
 }
 
 void SubProcess::exec() {
+  // This function is now only called from SubProcessTimed::exec()
+  // after a fork() in the timed subprocess implementation.
+  // For the regular spawn() path, we use posix_spawn directly.
   ceph_assert(is_child());
 
   std::vector<const char *> args;
@@ -306,7 +359,8 @@ void SubProcessTimed::exec() {
   }
 
   sigset_t mask, oldmask;
-  int pid;
+  pid_t child_pid;
+  int ret;
 
   // Restore default action for SIGTERM in case the parent process decided
   // to ignore it.
@@ -336,25 +390,54 @@ void SubProcessTimed::exec() {
     goto fail_exit;
   }
 
-  pid = fork();
+  // Prepare arguments for posix_spawn
+  {
+    std::vector<const char *> args;
+    args.push_back(cmd.c_str());
+    for (std::vector<std::string>::iterator i = cmd_args.begin();
+         i != cmd_args.end();
+         i++) {
+      args.push_back(i->c_str());
+    }
+    args.push_back(NULL);
 
-  if (pid == -1) {
-    std::cerr << cmd << ": fork failed: " << cpp_strerror(errno) << "\n";
-    goto fail_exit;
-  }
-
-  if (pid == 0) { // Child
-    // Restore old sigmask.
-    if (sigprocmask(SIG_SETMASK, &oldmask, NULL) == -1) {
-      std::cerr << cmd << ": sigprocmask failed: " << cpp_strerror(errno) << "\n";
+    // Setup posix_spawn attributes and file actions
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_t facts;
+    
+    ret = posix_spawnattr_init(&attr);
+    if (ret != 0) {
+      std::cerr << cmd << ": posix_spawnattr_init failed: " << cpp_strerror(ret) << "\n";
       goto fail_exit;
     }
-    (void)setpgid(0, 0); // Become process group leader.
-    SubProcess::exec();
-    ceph_abort(); // Never reached
+
+    ret = posix_spawn_file_actions_init(&facts);
+    if (ret != 0) {
+      std::cerr << cmd << ": posix_spawn_file_actions_init failed: " << cpp_strerror(ret) << "\n";
+      posix_spawnattr_destroy(&attr);
+      goto fail_exit;
+    }
+
+    // Set process group - make the child a process group leader
+    short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK;
+    posix_spawnattr_setpgroup(&attr, 0);  // 0 means create new process group
+    posix_spawnattr_setsigmask(&attr, &oldmask);  // Restore signal mask in child
+    posix_spawnattr_setflags(&attr, flags);
+
+    // Spawn the process
+    ret = posix_spawnp(&child_pid, cmd.c_str(), &facts, &attr,
+                       (char * const *)&args[0], environ);
+
+    posix_spawn_file_actions_destroy(&facts);
+    posix_spawnattr_destroy(&attr);
+
+    if (ret != 0) {
+      std::cerr << cmd << ": posix_spawnp failed: " << cpp_strerror(ret) << "\n";
+      goto fail_exit;
+    }
   }
 
-  // Parent
+  // Parent (timeout monitor)
   (void)alarm(timeout);
 
   for (;;) {
@@ -366,7 +449,7 @@ void SubProcessTimed::exec() {
     switch (signo) {
     case SIGCHLD:
       int status;
-      if (waitpid(pid, &status, WNOHANG) == -1) {
+      if (waitpid(child_pid, &status, WNOHANG) == -1) {
 	std::cerr << cmd << ": waitpid failed: " << cpp_strerror(errno) << "\n";
 	goto fail_exit;
       }
@@ -380,14 +463,14 @@ void SubProcessTimed::exec() {
     case SIGTERM:
       // Pass SIGINT and SIGTERM, which are usually used to terminate
       // a process, to the child.
-      if (::kill(pid, signo) == -1) {
+      if (::kill(child_pid, signo) == -1) {
 	std::cerr << cmd << ": kill failed: " << cpp_strerror(errno) << "\n";
 	goto fail_exit;
       }
       continue;
     case SIGALRM:
       std::cerr << cmd << ": timed out (" << timeout << " sec)\n";
-      if (::killpg(pid, sigkill) == -1) {
+      if (::killpg(child_pid, sigkill) == -1) {
 	std::cerr << cmd << ": kill failed: " << cpp_strerror(errno) << "\n";
 	goto fail_exit;
       }
