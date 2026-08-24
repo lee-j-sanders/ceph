@@ -171,6 +171,16 @@ class CBT(Task):
 
     def end(self):
         super(CBT, self).end()
+        log.info('Copying CBT results to /var/log/ceph/cbt for archiving...')
+        self.first_mon.run(
+            args=[
+                'sudo', 'mkdir', '-p', '/var/log/ceph/cbt',
+                run.Raw('&&'),
+                'sudo', 'cp', '-r',
+                self.cbt_dir + '/.',
+                '/var/log/ceph/cbt/',
+            ]
+        )
         testdir = misc.get_testdir(self.ctx)
         self.first_mon.run(
             args=[
